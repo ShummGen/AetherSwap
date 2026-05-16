@@ -17,26 +17,51 @@ from buff.buyer import BuffAuthExpired, BuffVerificationRequired
 
 STEAM_FEE_FACTOR = 1.15  # Steam take rate for calculating net proceeds
 
-def _fetch_steam_sell_data(market_hash_name: str, config: dict, app_id: int = 730) -> Optional[Dict[str, Any]]:
+def _fetch_steam_sell_data(
+    market_hash_name: str,
+    config: dict,
+    app_id: int = 730,
+    *,
+    return_error: bool = False,
+):
     from app.config_loader import get_steam_credentials
     from steam.session import create_market_session
     from steam.market_orders import get_sell_orders_cny, compute_smart_list_price
     name = (market_hash_name or "").strip()
     if not name:
-        return None
+        reason = "Steam 市场名为空"
+        return (None, reason) if return_error else None
     cred = get_steam_credentials()
     cookies = cred.get("cookies", "")
     steam_id = cred.get("steam_id", "")
     if not cookies or not steam_id:
-        return None
+        missing = []
+        if not cookies:
+            missing.append("Cookie")
+        if not steam_id:
+            missing.append("steam_id")
+        reason = "Steam 凭据缺失: " + "、".join(missing)
+        return (None, reason) if return_error else None
     try:
         session = create_market_session(cookies, steam_id)
         cfg = config.get("pipeline", {})
         wall_volume = int(cfg.get("sell_price_wall_volume", 20))
         max_ignore = int(cfg.get("sell_price_max_ignore_volume", 4))
-        result = get_sell_orders_cny(session, name, app_id=app_id, request_delay=1.0)
-        if not result or not result.get("sell_orders"):
-            return None
+        orders_result = get_sell_orders_cny(
+            session,
+            name,
+            app_id=app_id,
+            request_delay=1.0,
+            return_error=True,
+        )
+        if isinstance(orders_result, tuple) and len(orders_result) == 2:
+            result, reason = orders_result
+        else:
+            result, reason = orders_result, None
+        if not result:
+            return (None, reason or "Steam 卖单接口返回空数据") if return_error else None
+        if not result.get("sell_orders"):
+            return (None, reason or "Steam 返回空卖单图") if return_error else None
         orders = result["sell_orders"]
         price, _ = compute_smart_list_price(
             orders,
@@ -45,9 +70,17 @@ def _fetch_steam_sell_data(market_hash_name: str, config: dict, app_id: int = 73
             min_step=0,
             offset=0,
         )
-        return {"sell_orders": orders, "smart_price": price}
-    except Exception:
-        return None
+        if price is None:
+            reason = "Steam 卖单已获取，但无法计算智能参考价"
+            return (None, reason) if return_error else None
+        data = {"sell_orders": orders, "smart_price": price}
+        return (data, None) if return_error else data
+    except Exception as e:
+        detail = str(e).strip()
+        if len(detail) > 120:
+            detail = detail[:117] + "..."
+        reason = f"Steam 卖单获取异常: {type(e).__name__}" + (f" - {detail}" if detail else "")
+        return (None, reason) if return_error else None
 
 def _check_buff_price(
     item,
@@ -66,7 +99,8 @@ def _check_buff_price(
     orders = buff_client.get_sell_orders(gid, game_buff)
     if not orders:
         if log_fn:
-            log_fn(f"[Buff]   → 预检未通过: 无法获取 Buff 卖单信息（检查） (goods_id={gid})", "warn")
+            reason = "接口返回 None，可能是网络/鉴权/风控问题" if orders is None else "Buff 当前无在售卖单"
+            log_fn(f"[Buff]   → 预检未通过: 无法获取 Buff 卖单信息：{reason} (goods_id={gid})", "warn")
         return False, None
     lowest_price, _ = count_lowest_price_orders(orders)
     if lowest_price <= 0:
@@ -340,11 +374,13 @@ def _check_max_discount_precheck(
         max_discount_float = float(max_discount)
         if smart_price is None or smart_price <= 0:
             if log_fn:
-                log_fn("[稳定性]   → 预检未通过: 无法获取 Steam 参考价（可能是网络问题或限流）", "warn")
+                log_fn("[稳定性]   → 预检未通过: Steam 卖单已返回，但智能参考价为空或无效", "warn")
             return False
         if est_ratio is None or est_ratio <= 0:
             if log_fn:
-                log_fn("[稳定性]   → 预检未通过: 无法计算预估比例 (Buff最低价={plan_price:.2f}, Steam参考价={ref_price_est:.2f})", "warn")
+                plan_str = f"{plan_price:.2f}" if isinstance(plan_price, (int, float)) else "无效"
+                ref_str = f"{ref_price_est:.2f}" if isinstance(ref_price_est, (int, float)) else "无效"
+                log_fn(f"[稳定性]   → 预检未通过: 无法计算预估比例 (Buff最低价={plan_str}, Steam参考价={ref_str})", "warn")
             return False
         if est_ratio >= max_discount_float:
             if log_fn:
@@ -415,10 +451,12 @@ def pick_stable_item(
                     continue
 
             # 2. 拉取 Steam 挂单数据
-            steam_sell_data = _fetch_steam_sell_data(market_hash_name, config, app_id=730)
+            steam_sell_data, steam_error = _fetch_steam_sell_data(
+                market_hash_name, config, app_id=730, return_error=True
+            )
             if not steam_sell_data:
                 if item_log:
-                    item_log("[稳定性] 预检未通过: 无法获取 Steam 卖单信息（可能是网络问题或限流）", "warn")
+                    item_log(f"[稳定性] 预检未通过: 无法获取 Steam 卖单信息：{steam_error or '未知原因'}", "warn")
                 if gid:
                     stability_failed.add(gid)
                 if failure_delay > 0:
@@ -753,7 +791,8 @@ def lock_and_confirm_payment(
             log_fn(f"[Buff]   → 复用预检阶段缓存的 Buff 卖单数据 → {len(orders)} 条", "info")
     if not orders:
         if log_fn:
-            log_fn("[Buff]   → 无在售，跳过本件", "warn")
+            reason = "接口返回 None，可能是网络/鉴权/风控问题" if orders is None else "Buff 当前无在售卖单"
+            log_fn(f"[Buff]   → 无法获取 Buff 卖单信息：{reason}，跳过本件", "warn")
         return None
     lowest_price, count_at_lowest = count_lowest_price_orders(orders)
     if log_fn:
@@ -775,8 +814,14 @@ def lock_and_confirm_payment(
         or (sell_pressure_threshold is not None and sell_pressure_threshold > 0 and int(item.get("daily_volume", 0) or 0) > 0)
     )
     cached_steam_data = item.get("_steam_sell_data")
+    steam_sell_error = None
     if need_steam:
-        steam_sell_data = cached_steam_data if cached_steam_data is not None else _fetch_steam_sell_data(market_hash_name, config, app_id=730)
+        if cached_steam_data is not None:
+            steam_sell_data = cached_steam_data
+        else:
+            steam_sell_data, steam_sell_error = _fetch_steam_sell_data(
+                market_hash_name, config, app_id=730, return_error=True
+            )
         if cached_steam_data is not None and log_fn:
             log_fn("[Buff]   → 复用稳定性阶段已缓存的 Steam 卖单数据", "info")
     else:
@@ -787,7 +832,8 @@ def lock_and_confirm_payment(
         max_discount = float(max_discount)
         if ref_price is None or ref_price <= 0:
             if log_fn:
-                log_fn("[Buff]   → 二次验证: 无法获取 Steam 参考价（可能是网络问题或限流），跳过本件", "warn")
+                reason = steam_sell_error or "Steam 卖单为空或智能参考价无效"
+                log_fn(f"[Buff]   → 二次验证: 无法获取 Steam 参考价：{reason}，跳过本件", "warn")
             return SKIP_VERIFICATION_FAILED
         ref_price = _adjust_ref_price_for_daily_high(
             market_hash_name, ref_price, config, log_fn, app_id=730

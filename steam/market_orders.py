@@ -2,6 +2,7 @@ import re
 import threading
 import time
 import logging
+import math
 from typing import Any, List, Optional, Tuple
 
 from steam.client import build_listing_url
@@ -27,6 +28,21 @@ _ITEM_NAMEID_PATTERNS = [
     re.compile(r"Market_LoadOrderSpread\s*\(\s*(\d+)\s*\)", re.I),
     re.compile(r"item_nameid['\"]?\s*[:=]\s*['\"]?(\d+)", re.I),
 ]
+def _format_request_error(prefix: str, exc: Exception) -> str:
+    detail = str(exc).strip()
+    if len(detail) > 120:
+        detail = detail[:117] + "..."
+    return f"{prefix}: {type(exc).__name__}" + (f" - {detail}" if detail else "")
+
+def _http_error_reason(where: str, status_code: int) -> str:
+    if status_code == 429:
+        return f"{where} HTTP 429（Steam 限流）"
+    if status_code == 403:
+        return f"{where} HTTP 403（访问被拒绝，可能是 Cookie 失效、地区或 IP 风控）"
+    if status_code in (500, 502, 503, 504):
+        return f"{where} HTTP {status_code}（Steam 服务端或网络网关异常）"
+    return f"{where} HTTP {status_code}"
+
 def _extract_item_nameid(html: str) -> Optional[str]:
     for pat in _ITEM_NAMEID_PATTERNS:
         m = pat.search(html)
@@ -40,22 +56,24 @@ def get_item_nameid(
     *,
     timeout: int = 15,
     use_cache: bool = True,
-) -> Optional[str]:
+    return_error: bool = False,
+):
     key = (market_hash_name.strip(), app_id)
     db_nameid = db_get_item_nameid(key[0])
     if db_nameid:
-        return db_nameid
+        return (db_nameid, None) if return_error else db_nameid
     if use_cache:
         with _item_nameid_cache_lock:
             entry = _item_nameid_cache.get(key)
         if entry and time.time() < entry[1]:
-            return entry[0]
+            return (entry[0], None) if return_error else entry[0]
     url = build_listing_url(market_hash_name, app_id)
     headers = {
         "Accept": "*/*",
         "Referer": url,
     }
     pm = get_proxy_manager()
+    last_error = ""
     for attempt in range(3):
         failed = (attempt > 0)
         proxies = pm.get_proxies_for_request(failed=failed)
@@ -68,13 +86,19 @@ def get_item_nameid(
                     if use_cache:
                         with _item_nameid_cache_lock:
                             _item_nameid_cache[key] = (nameid, time.time() + _ITEM_NAMEID_TTL)
-                return nameid
+                    return (nameid, None) if return_error else nameid
+                last_error = "Steam 市场页面未解析到 item_nameid（可能物品名不正确、页面被风控或地区不可访问）"
+                break
+            last_error = _http_error_reason("Steam 市场页面", r.status_code)
         except Exception as e:
+            last_error = _format_request_error("Steam 市场页面请求异常", e)
             logger.debug("获取item_nameid失败 (attempt=%d/3) proxies=%s, error=%s", attempt+1, proxies, type(e).__name__)
         
         if attempt < 2:
             jittered_sleep(1.0)
 
+    if return_error:
+        return None, last_error or "无法打开 Steam 市场页面"
     return None
 _cb_lock = threading.Lock()  
 _cb_fail_streak = 0          
@@ -90,11 +114,14 @@ def fetch_item_orders_histogram(
     language: str = "english",
     currency: int = CURRENCY_CNY,
     timeout: int = 15,
-) -> Optional[dict]:
+    return_error: bool = False,
+):
     global _cb_fail_streak, _cb_open_until
     with _cb_lock:
         if time.time() < _cb_open_until:
-            return None
+            remaining = max(1, int(math.ceil(_cb_open_until - time.time())))
+            reason = f"Steam 市场请求熔断中，约 {remaining} 秒后重试（之前连续失败）"
+            return (None, reason) if return_error else None
     url = "https://steamcommunity.com/market/itemordershistogram"
     params = {
         "country": country,
@@ -111,6 +138,7 @@ def fetch_item_orders_histogram(
     }
     pm = get_proxy_manager()
     any_success = False
+    last_error = ""
     
     for attempt in range(3):
         if attempt == 0:
@@ -124,16 +152,25 @@ def fetch_item_orders_histogram(
                 timeout=timeout, proxies=effective_proxies, verify=False,
             )
             if r.status_code == 200:
+                any_success = True
                 data = r.json()
                 if isinstance(data, dict) and data.get("success") == 1:
                     with _cb_lock:
                         _cb_fail_streak = 0  
-                    return data
-                
+                    return (data, None) if return_error else data
+
+                if isinstance(data, dict):
+                    msg = data.get("message") or data.get("error") or ""
+                    suffix = f"，返回: {msg}" if msg else ""
+                    last_error = f"Steam 直方图接口返回 success={data.get('success')}{suffix}"
+                else:
+                    last_error = "Steam 直方图接口返回非 JSON 对象"
                 logger.debug("直方图 success非1 resp=%s", str(data)[:150])
             else:
+                last_error = _http_error_reason("Steam 直方图接口", r.status_code)
                 logger.debug("直方图 HTTP %s (attempt=%d)", r.status_code, attempt+1)
         except Exception as e:
+            last_error = _format_request_error("Steam 直方图请求异常", e)
             logger.debug("直方图失败 (attempt=%d/3) proxy=%s err=%s: %s", attempt+1, effective_proxies is not None, type(e).__name__, str(e)[:60])
             
         if attempt < 2:
@@ -147,11 +184,16 @@ def fetch_item_orders_histogram(
         else:
             streak_snap = None
     if streak_snap is not None:
+        last_error = f"Steam 市场连续 {streak_snap} 轮全部失败，已熔断 {_CB_COOLDOWN_SEC // 60} 分钟，请确认加速器/代理是否正常"
         logger.warning(
             "Steam市场连续 %d 轮全部失败，熔断 %d 分钟。请确认加速器/代理是否正常。",
             streak_snap, _CB_COOLDOWN_SEC // 60
         )
 
+    if return_error:
+        if not last_error and not any_success:
+            last_error = "Steam 直方图接口无响应"
+        return None, last_error or "Steam 直方图接口返回空数据"
     return None
 def cents_to_yuan(cents: int) -> float:
     return cents / 100.0
@@ -178,27 +220,31 @@ def get_sell_orders_cny(
     language: str = "english",
     request_delay: float = 1.0,
     use_cache: bool = True,
-) -> Optional[dict]:
+    return_error: bool = False,
+):
     key = (market_hash_name.strip(), app_id)
     if use_cache:
         with _sell_orders_cache_lock:
             entry = _sell_orders_cache.get(key)
         if entry and time.time() < entry[1]:
-            return entry[0]
-    item_nameid = get_item_nameid(session, market_hash_name, app_id)
+            return (entry[0], None) if return_error else entry[0]
+    item_nameid, nameid_error = get_item_nameid(
+        session, market_hash_name, app_id, return_error=True
+    )
     if not item_nameid:
-        return None
+        return (None, nameid_error or "无法获取 Steam item_nameid") if return_error else None
     if request_delay > 0:
         jittered_sleep(request_delay)
-    data = fetch_item_orders_histogram(
+    data, histogram_error = fetch_item_orders_histogram(
         session,
         item_nameid,
         country=country,
         language=language,
         currency=CURRENCY_CNY,
+        return_error=True,
     )
     if not data:
-        return None
+        return (None, histogram_error or "无法获取 Steam 直方图数据") if return_error else None
     raw_lowest = data.get("lowest_sell_order")
     lowest_price: Optional[float] = None
     if raw_lowest is not None:
@@ -211,6 +257,12 @@ def get_sell_orders_cny(
     if use_cache:
         with _sell_orders_cache_lock:
             _sell_orders_cache[key] = (result, time.time() + _SELL_ORDERS_TTL)
+    if return_error:
+        if not sell_orders:
+            return result, "Steam 返回空卖单图（可能当前无寄售，或接口被限制返回了不完整数据）"
+        if lowest_price is None:
+            return result, "Steam 返回了卖单图，但 lowest_sell_order 无法解析"
+        return result, None
     return result
 STEAM_MIN_PRICE = 0.03
 def _get_dynamic_thresholds(current_price: float) -> Tuple[float, float]:

@@ -223,12 +223,21 @@ def _build_listing_plan(
             continue
 
         try:
-            orders_data = get_sell_orders_cny(session, market_hash_name, app_id=int(it.get("appid", 730)))
+            orders_result = get_sell_orders_cny(
+                session,
+                market_hash_name,
+                app_id=int(it.get("appid", 730)),
+                return_error=True,
+            )
+            if isinstance(orders_result, tuple) and len(orders_result) == 2:
+                orders_data, orders_error = orders_result
+            else:
+                orders_data, orders_error = orders_result, None
         except Exception as e:
             ctx.log(f"[出售] {name} assetid={aid} 拉取卖单异常: {type(e).__name__} - {e}", "error", category="steam")
             continue
         if not orders_data or not orders_data.get("sell_orders"):
-            ctx.log(f"[出售] {name} assetid={aid} 无法获取 Steam 卖单（可能是网络问题或限流），跳过", "warn", category="steam")
+            ctx.log(f"[出售] {name} assetid={aid} 无法获取 Steam 卖单：{orders_error or '未知原因'}，跳过", "warn", category="steam")
             continue
 
         list_price, reason = compute_smart_list_price(

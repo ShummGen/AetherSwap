@@ -252,7 +252,6 @@ def api_delist_purchase(idx: int):
         try:
             ok_s, res_s = run_sync_sold_from_history(log_fn=log_fn)
             if ok_s:
-                from app.state import reload_transactions, get_purchases
                 reload_transactions()
                 pur = get_purchases()
                 if 0 <= idx < len(pur):
