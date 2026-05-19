@@ -145,6 +145,22 @@ def _extract_ssr_render_context(html: str) -> Optional[dict]:
         logger.debug("解析 Steam SSR renderContext 失败: %s", type(e).__name__)
         return None
 
+def _normalize_market_hash_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+def _extract_orderbook_query_name(query_key: Any) -> str:
+    if (
+        isinstance(query_key, list)
+        and len(query_key) >= 4
+        and query_key[0] == "market"
+        and query_key[1] == "orderbook"
+        and isinstance(query_key[3], str)
+    ):
+        return query_key[3].strip()
+    return ""
+
 def _steam_cents_to_cny(
     cents: int,
     currency: int,
@@ -187,6 +203,7 @@ def _parse_compact_orders_cny(
 
 def _extract_ssr_orderbook_cny(
     html: str,
+    market_hash_name: Optional[str] = None,
     usd_to_cny_rate: float = USD_TO_CNY_DEFAULT,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     ctx = _extract_ssr_render_context(html)
@@ -199,43 +216,70 @@ def _extract_ssr_orderbook_cny(
     queries = query_data.get("queries") if isinstance(query_data, dict) else None
     if not isinstance(queries, list):
         return None, "Steam SSR queryData 中没有 queries"
+    target_name = _normalize_market_hash_name(market_hash_name)
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
     for query in queries:
         if not isinstance(query, dict):
             continue
         data = (query.get("state") or {}).get("data")
         if not isinstance(data, dict) or "rgCompactSellOrders" not in data:
             continue
+        candidates.append((_extract_orderbook_query_name(query.get("queryKey")), data))
+    if not candidates:
+        return None, "Steam 新版页面未找到 market/orderbook 数据"
+    selected_name = ""
+    selected_data: Optional[Dict[str, Any]] = None
+    if target_name:
+        for query_name, data in candidates:
+            if _normalize_market_hash_name(query_name) == target_name:
+                selected_name = query_name
+                selected_data = data
+                break
+        if selected_data is None:
+            target_folded = target_name.casefold()
+            for query_name, data in candidates:
+                if _normalize_market_hash_name(query_name).casefold() == target_folded:
+                    selected_name = query_name
+                    selected_data = data
+                    break
+    if selected_data is None:
+        selected_name, selected_data = candidates[0]
+    try:
+        currency = int(selected_data.get("eCurrency") or 0)
+    except (ValueError, TypeError):
+        currency = 0
+    currency_code = _STEAM_CURRENCY_CODES.get(currency)
+    exchange_rates = _load_exchange_rates()
+    if not currency_code:
+        return None, f"Steam 新版订单簿币种暂不支持: eCurrency={currency}"
+    if currency_code not in ("CNY", "USD") and currency_code not in exchange_rates:
+        return None, f"Steam 新版订单簿币种={currency_code}(eCurrency={currency})，但 exchange_rate.json 缺少该币种汇率"
+    orders = _parse_compact_orders_cny(
+        selected_data.get("rgCompactSellOrders"),
+        currency,
+        usd_to_cny_rate,
+        exchange_rates,
+    )
+    if not orders:
+        return None, "Steam 新版订单簿为空或无法解析卖单"
+    lowest_price = orders[0][0]
+    raw_lowest = selected_data.get("amtMinSellOrder")
+    if raw_lowest is not None:
         try:
-            currency = int(data.get("eCurrency") or 0)
+            converted = _steam_cents_to_cny(
+                int(raw_lowest), currency, usd_to_cny_rate, exchange_rates
+            )
+            if converted is not None and converted > 0:
+                lowest_price = round(converted, 2)
         except (ValueError, TypeError):
-            currency = 0
-        currency_code = _STEAM_CURRENCY_CODES.get(currency)
-        exchange_rates = _load_exchange_rates()
-        if not currency_code:
-            return None, f"Steam 新版订单簿币种暂不支持: eCurrency={currency}"
-        if currency_code not in ("CNY", "USD") and currency_code not in exchange_rates:
-            return None, f"Steam 新版订单簿币种={currency_code}(eCurrency={currency})，但 exchange_rate.json 缺少该币种汇率"
-        orders = _parse_compact_orders_cny(
-            data.get("rgCompactSellOrders"),
-            currency,
-            usd_to_cny_rate,
-            exchange_rates,
+            pass
+    if target_name and selected_name and _normalize_market_hash_name(selected_name) != target_name:
+        logger.debug(
+            "Steam SSR orderbook fallback to non-exact queryKey: target=%s selected=%s",
+            target_name,
+            selected_name,
         )
-        if not orders:
-            return None, "Steam 新版订单簿为空或无法解析卖单"
-        lowest_price = orders[0][0]
-        raw_lowest = data.get("amtMinSellOrder")
-        if raw_lowest is not None:
-            try:
-                converted = _steam_cents_to_cny(
-                    int(raw_lowest), currency, usd_to_cny_rate, exchange_rates
-                )
-                if converted is not None and converted > 0:
-                    lowest_price = round(converted, 2)
-            except (ValueError, TypeError):
-                pass
-        return {"lowest_price": lowest_price, "sell_orders": orders}, None
-    return None, "Steam 新版页面未找到 market/orderbook 数据"
+    return {"lowest_price": lowest_price, "sell_orders": orders}, None
 
 def _fetch_ssr_sell_orders_cny(
     session,
@@ -257,7 +301,11 @@ def _fetch_ssr_sell_orders_cny(
         try:
             r = session.get(url, headers=headers, timeout=timeout, proxies=proxies, allow_redirects=True)
             if r.status_code == 200:
-                result, parse_error = _extract_ssr_orderbook_cny(r.text, usd_to_cny_rate)
+                result, parse_error = _extract_ssr_orderbook_cny(
+                    r.text,
+                    market_hash_name=market_hash_name,
+                    usd_to_cny_rate=usd_to_cny_rate,
+                )
                 if result:
                     return result, None
                 last_error = parse_error or "Steam 新版页面订单簿解析失败"
@@ -449,6 +497,17 @@ def get_sell_orders_cny(
             entry = _sell_orders_cache.get(key)
         if entry and time.time() < entry[1]:
             return (entry[0], None) if return_error else entry[0]
+    ssr_result, ssr_error = _fetch_ssr_sell_orders_cny(
+        session,
+        market_hash_name,
+        app_id,
+        usd_to_cny_rate=usd_to_cny_rate,
+    )
+    if ssr_result:
+        if use_cache:
+            with _sell_orders_cache_lock:
+                _sell_orders_cache[key] = (ssr_result, time.time() + _SELL_ORDERS_TTL)
+        return (ssr_result, None) if return_error else ssr_result
     item_nameid = None
     nameid_error = None
     if use_cache:
@@ -458,19 +517,7 @@ def get_sell_orders_cny(
                 entry = _item_nameid_cache.get(key)
             if entry and time.time() < entry[1]:
                 item_nameid = entry[0]
-    ssr_error = None
     if not item_nameid:
-        ssr_result, ssr_error = _fetch_ssr_sell_orders_cny(
-            session,
-            market_hash_name,
-            app_id,
-            usd_to_cny_rate=usd_to_cny_rate,
-        )
-        if ssr_result:
-            if use_cache:
-                with _sell_orders_cache_lock:
-                    _sell_orders_cache[key] = (ssr_result, time.time() + _SELL_ORDERS_TTL)
-            return (ssr_result, None) if return_error else ssr_result
         item_nameid, nameid_error = get_item_nameid(
             session, market_hash_name, app_id, return_error=True
         )
